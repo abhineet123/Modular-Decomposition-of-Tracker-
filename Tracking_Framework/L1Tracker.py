@@ -9,19 +9,21 @@ from l1.affine2image import aff2image
 from l1.misc import *
 
 class L1Tracker(TrackerBase):
-    def __init__(self, n_sample, angle_threshold, res, no_of_templates, alpha):
+    def __init__(self, no_of_samples, angle_threshold, res, no_of_templates, alpha, multi_approach='none', use_scv=False):
 
         print "Initializing ICT tracker with:"
-        print " n_sample=", n_sample
+        print " no_of_samples=", no_of_samples
         print " angle_threshold=", angle_threshold
         print " res=", res
         print " no_of_templates=", no_of_templates
         print " alpha=", alpha
+        print " multi_approach=", multi_approach
 
-        self.n_sample = n_sample
+        self.n_sample = no_of_samples
         self.angle_threshold = angle_threshold
         self.no_of_templates = no_of_templates
         self.alpha = alpha
+
         self.Lambda = np.matrix([[0.2, 0.001, 10]])
         self.sz_T = np.matrix(res)
         self.rel_std_afnv = np.matrix([[0.005, 0.003, 0.005, 0.003, 1, 1]])
@@ -31,6 +33,8 @@ class L1Tracker(TrackerBase):
         #self.dt2 = np.dtype('uint8')
         #self.dt3 = np.dtype('float64')
         self.initialized = False
+        self.multi_approach=multi_approach
+        self.use_scv=use_scv
 
         self.occlusionNf = 0
 
@@ -74,10 +78,10 @@ class L1Tracker(TrackerBase):
 
         # L1 function settings
         dim_T = self.sz_T[0, 0] * self.sz_T[0, 1]    # number of elements in one template, sz_T(1)*sz_T(2)=12x15 = 180
-        self.A = np.matrix(np.concatenate((self.T, np.matrix(np.identity(dim_T))),
-                                          axis=1)) # data matrix is composed of T, positive trivial T.
-        (aff_obj) = corners2affine(self.position,
-                                   self.sz_T) # get affine transformation parameters from the corner points in the first frame
+         # data matrix is composed of T, positive trivial T.
+        self.A = np.matrix(np.concatenate((self.T, np.matrix(np.identity(dim_T))), axis=1))
+         # get affine transformation parameters from the corner points in the first frame
+        (aff_obj) = corners2affine(self.position, self.sz_T)
         self.map_aff = aff_obj['afnv']
         self.aff_samples = np.dot(np.ones((self.n_sample, 1), self.dt), self.map_aff)
 
@@ -92,8 +96,8 @@ class L1Tracker(TrackerBase):
         temp1 = np.concatenate((self.T, self.fixT), axis=1)
         self.Temp1 = temp1 * np.linalg.pinv(temp1)
 
-        temp1 = np.concatenate((self.A, self.fixT), axis=1)
-        colDim = np.matrix(temp1.shape).item(1)
+        #temp1 = np.concatenate((self.A, self.fixT), axis=1)
+        #colDim = np.matrix(temp1.shape).item(1)
         #self.Coeff = np.zeros((colDim, self.nframes), self.dt)
 
         self.initialized = True

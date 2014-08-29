@@ -2,81 +2,122 @@ import os
 import time
 from TrackingParams import *
 from FilteringParams import *
-from Homography import *
-from ImageUtils import *
 from GUI import *
 from Misc import *
+import webbrowser
 
 from matplotlib import pyplot as plt
 
 class InteractiveTrackingApp:
-    def __init__(self, init_frame, root_path,
-                 track_window_name, params, labels, default_id=None):
+    def __init__(self, init_frame, root_path, track_window_name, params,
+                 tracking_params, filtering_params, labels, default_id=None,
+                success_threshold=5, batch_mode=False, agg_filename=None, avg_filename=None):
+
 
         self.root_path=root_path
         self.params=params
+        self.agg_filename=agg_filename
+        self.avg_filename=avg_filename
+        #self.tracking_params=tracking_params
+        #self.filtering_params=filtering_params
         self.labels=labels
         if default_id==None:
             default_id=[0 for i in xrange(len(self.params))]
         self.default_id=default_id
         self.first_call=True
 
-        filter_index=labels.index('filter')
-        self.filters_ids=dict(zip(params[filter_index], [i for i in xrange(len(params[filter_index]))]))
-        self.filter_type=default_id[filter_index]
-        self.filters_name=params[filter_index][self.filter_type]
-        self.filters=[]
-        for i in xrange(1, len(params[filter_index])):
-            self.filters.append(FilterParams(params[filter_index][i]))
+        if len(self.default_id)!=len(self.params):
+            raise SyntaxError('Mismatch between the sizes of default ids and params')
 
+        if len(self.labels)!=len(self.params):
+            raise SyntaxError('Mismatch between the sizes of labels and params')
+
+        # initialize filters
+        filter_index=labels.index('filter')
+        #self.filters_ids=dict(zip(params[filter_index], [i for i in xrange(len(params[filter_index]))]))
+        self.filter_type=params[filter_index][default_id[filter_index]]
+        self.filters={}
+        for i in xrange(1, len(params[filter_index])):
+            filter_type=params[filter_index][i]
+            self.filters[filter_type]=FilterParams(filter_type, filtering_params[filter_type])
+
+        # initialize trackers
         tracker_index=labels.index('tracker')
-        self.tracker_ids=dict(zip(params[tracker_index], [i for i in xrange(len(params[tracker_index]))]))
-        self.tracker_type=default_id[tracker_index]
-        self.trackers=[]
+        #self.tracker_ids=dict(zip(params[tracker_index], [i for i in xrange(len(params[tracker_index]))]))
+        self.tracker_type=params[tracker_index][default_id[tracker_index]]
+        self.trackers={}
         for i in xrange(len(params[tracker_index])):
-            self.trackers.append(TrackingParams(params[tracker_index][i]))
+            tracker_type=params[tracker_index][i]
+            self.trackers[tracker_type]=TrackingParams(tracker_type, tracking_params[tracker_type])
 
         self.source=default_id[labels.index('source')]
 
         self.init_frame=init_frame
         self.track_window_name = track_window_name
         self.proc_window_name='Processed Images'
+        self.count=0
 
         self.gray_img = None
         self.proc_img = None
         self.paused = False
-        self.enable_blurring=False
+        self.enable_smoothing=False
+        self.smooth_image=None
         self.window_inited=False
         self.init_track_window=True
         self.img = None
         self.init_params=[]
         self.times = 1
+        self.max_cam=3
 
         self.reset=False
         self.exit_event=False
         self.write_res=False
         self.cap=None
 
-        self.initPlotParams()
+        self.multi_channel=False
+        self.success_threshold=success_threshold
 
-        gui_title="Choose Input Video Parameters"
-        self.gui_obj=GUI(self, gui_title)
-        #self.gui_obj.initGUI()
-        #self.gui_obj.root.mainloop()
+        self.initPlotParams()
+        self.tracker_pause=False
+
+        self.batch_mode=batch_mode
+
+        if self.batch_mode:
+            init_params=self.getInitParams()
+            self.initSystem(init_params)
+        else:
+            gui_title="Choose Input Video Parameters"
+            self.gui_obj=GUI(self, gui_title)
+            #self.gui_obj.initGUI()
+            #self.gui_obj.root.mainloop()
+
+        self.success_count=0
+        self.success_drift=[]
+
+    def getInitParams(self):
+        init_params=[]
+        for i in xrange(len(self.params)):
+            if self.labels[i]=='task':
+                type_index=self.labels.index('type')
+                param=self.params[i][self.default_id[type_index]][self.default_id[i]]
+            else:
+                param=self.params[i][self.default_id[i]]
+            init_params.append(param)
+        #print 'init_params=', init_params
+        #sys.exit()
+        return init_params
 
     def initCamera(self):
         print "Getting input from camera"
         if self.cap!=None:
             self.cap.release()
-        self.cap = cv2.VideoCapture(0)
-        if self.cap==None:
-            print "Could not access video camera"
-            self.exit_event=True
-            sys.exit()
+        self.cap = cv2.VideoCapture(1)
         dWidth = self.cap.get(3)
         dHeight = self.cap.get(4)
+        if dWidth==0 or dHeight==0:
+            raise SystemExit("No valid camera found")
         print "Frame size : ", dWidth, " x ", dHeight
-        self.res_file = open('camera_res_%s.txt' % self.tracker_name, 'w')
+        self.res_file = open('camera_res_%s.txt' % self.tracker_type, 'w')
         self.res_file.write('%-8s%-8s%-8s%-8s%-8s%-8s%-8s%-8s%-8s\n' % (
             'frame', 'ulx', 'uly', 'urx', 'ury', 'lrx', 'lry', 'llx', 'lly'))
         self.no_of_frames=0
@@ -103,7 +144,7 @@ class InteractiveTrackingApp:
         print "Getting input from data: ", self.data_file
         if not os.path.exists(self.res_path):
             os.mkdir(self.res_path)
-        self.res_file = open(self.res_path + '/' + data_file + '_res_%s.txt'%self.tracker_name, 'w')
+        self.res_file = open(self.res_path + '/' + data_file + '_res_%s.txt'%self.tracker_type, 'w')
         self.res_file.write('%-8s%-8s%-8s%-8s%-8s%-8s%-8s%-8s%-8s\n' % (
             'frame', 'ulx', 'uly', 'urx', 'ury', 'lrx', 'lry', 'llx', 'lly'))
 
@@ -128,25 +169,56 @@ class InteractiveTrackingApp:
         print "\n"+"*"*60+"\n"
 
         self.inited=False
-        self.initFilterWindow()
+
+        self.success_count=0
+        self.success_drift=[]
+
+        if not self.batch_mode:
+            self.initFilterWindow()
         self.init_params=init_params
 
-        self.source=init_params[self.labels.index('source')]
+        self.source=self.init_params[self.labels.index('source')]
 
-        self.tracker_name=init_params[self.labels.index('tracker')]
-        self.tracker_type=self.tracker_ids[self.tracker_name]
+        self.color_space=self.init_params[self.labels.index('color_space')]
+        if self.color_space.lower()!='grayscale':
+            self.multi_channel=True
+        else:
+            self.multi_channel=False
+
+        self.tracker_type=self.init_params[self.labels.index('tracker')]
+        if not self.multi_channel:
+            print 'Disabling multichannel'
+            self.trackers[self.tracker_type].params['multi_approach'].val='none'
         self.tracker=self.trackers[self.tracker_type].update()
+        self.multi_approach=self.tracker.multi_approach
+        self.smoothing_type=self.init_params[self.labels.index('smoothing')]
 
-        self.filters_name=init_params[self.labels.index('filter')]
+        self.smoothing_kernel=int(self.init_params[self.labels.index('smoothing_kernel')])
+        if self.smoothing_type=='none':
+            print 'Smoothing is disabled'
+            self.enable_smoothing=False
+        else:
+            print 'Smoothing images with smoothing kernel size ', self.smoothing_kernel
+            self.enable_smoothing=True
+            if self.smoothing_type=='box':
+                self.smooth_image=lambda src: cv2.blur(src, (self.smoothing_kernel, self.smoothing_kernel))
+            elif self.smoothing_type=='bilateral':
+                self.smooth_image=lambda src: cv2.bilateralFilter(src, self.smoothing_kernel, 100, 100)
+            elif self.smoothing_type=='gauss':
+                self.smooth_image=lambda src: cv2.GaussianBlur(src, (self.smoothing_kernel, self.smoothing_kernel), 3)
+            elif self.smoothing_type=='median':
+                self.smooth_image=lambda src: cv2.medianBlur(src, self.smoothing_kernel)
+
         old_filter_type=self.filter_type
-        self.filter_type=self.filters_ids[self.filters_name]
-        if old_filter_type!=self.filter_type:
+        self.filter_type=self.init_params[self.labels.index('filter')]
+        if not self.batch_mode and old_filter_type!=self.filter_type:
             self.initFilterWindow()
 
-        if self.filter_type==0:
+        if self.filter_type=='none':
             print "Filtering disabled"
-        elif self.filter_type <=len(self.filters):
-            print "Using %s filtering" % self.filters[self.filter_type-1].type
+        elif self.filter_type in self.filters.keys():
+            self.tracker.use_scv=False
+            print "Using %s filtering" % self.filter_type
         else:
             print 'Invalid filter type: ', self.filter_type
             return False
@@ -243,24 +315,46 @@ class InteractiveTrackingApp:
 
     def on_frame(self, img, numtimes):
         #print "frame: ", numtimes
-        if self.first_call:
-            self.gui_obj.initWidgets(start_label='Reset')
+        if self.first_call and not self.batch_mode:
+            self.gui_obj.initWidgets(start_label='Restart')
             self.first_call=False
 
         self.count+=1
         self.times = numtimes
 
         self.img = img
-        self.gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        self.gray_img_float = self.gray_img.astype(np.float64)
+        #print "img.shape=",img.shape
 
-        self.proc_img=self.applyFiltering()
-        cv2.imshow(self.proc_window_name,  self.proc_img)
+        if not self.multi_channel:
+            self.gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            if self.enable_smoothing:
+                self.gray_img=self.smooth_image(self.gray_img)
+            self.gray_img_float = self.gray_img.astype(np.float64)
+            self.proc_img=self.applyFiltering()
+        else:
+            if self.enable_smoothing:
+                self.img=self.smooth_image(self.img)
+            if self.color_space=='RGB':
+                self.proc_img=self.img
+            elif self.color_space=='HSV':
+                self.proc_img=cv2.cvtColor(self.img,  cv2.COLOR_RGB2HSV)
+            elif self.color_space=='YCrCb':
+                self.proc_img=cv2.cvtColor(self.img,  cv2.COLOR_RGB2YCR_CB)
+            elif self.color_space=='HLS':
+                self.proc_img=cv2.cvtColor(self.img,  cv2.COLOR_RGB2HLS)
+            elif self.color_space=='Lab':
+                self.proc_img=cv2.cvtColor(self.img,  cv2.COLOR_RGB2LAB)
 
+        if not self.batch_mode:
+            cv2.imshow(self.proc_window_name,  self.proc_img)
+        elif self.count==100:
+            print 'Processing frame', self.times+1
+            self.count=0
         self.proc_img = self.proc_img.astype(np.float64)
 
         if not self.inited:
-            cv2.namedWindow(self.track_window_name)
+            if not self.batch_mode:
+                cv2.namedWindow(self.track_window_name)
             if self.from_cam:
                 pts=self.getTrackingObject()
                 if len(pts)<4:
@@ -269,6 +363,7 @@ class InteractiveTrackingApp:
                 init_array = np.array(pts).T
             else:
                 init_array = np.array(self.initparam).T
+
 
             self.tracker.initialize(self.proc_img, init_array)
 
@@ -291,6 +386,18 @@ class InteractiveTrackingApp:
             self.actual_corners=self.corners.copy()
 
         self.updateError(self.actual_corners, self.corners)
+        if self.curr_error<=self.success_threshold:
+            self.success_count+=1
+            self.success_drift.append(self.curr_error)
+
+        if self.tracker_pause:
+            raw_input("Press Enter to continue...")
+
+        self.last_time=self.current_time
+        self.current_time=time.clock()
+
+        self.average_fps=(self.times+1)/(self.current_time-self.start_time)
+        self.current_fps = 1.0 / (self.current_time - self.last_time)
 
         return True
 
@@ -315,29 +422,23 @@ class InteractiveTrackingApp:
                 self.corners[0, 2], self.corners[1, 2], self.corners[0, 3],
                 self.corners[1, 3]))
 
-        self.last_time=self.current_time
-        self.current_time=time.clock()
-
-        self.average_fps=(self.times+1)/(self.current_time-self.start_time)
-        self.current_fps = 1.0 / (self.current_time - self.last_time)
-
         fps_text = "%5.2f"%self.average_fps + "   %5.2f"%self.current_fps
         cv2.putText(annotated_img, fps_text, (5, 15), cv2.FONT_HERSHEY_COMPLEX_SMALL , 1, (255,255,255))
         cv2.imshow(self.track_window_name, annotated_img)
 
     def applyFiltering(self):
-        if self.filter_type == 0:
+        if self.filter_type == 'none':
             proc_img = self.gray_img
-        elif self.filter_type == self.filters_ids['DoG'] or \
-                        self.filter_type == self.filters_ids['gauss'] or \
-                        self.filter_type == self.filters_ids['bilateral'] or \
-                        self.filter_type == self.filters_ids['median'] or \
-                        self.filter_type == self.filters_ids['canny']:
-             proc_img=self.filters[self.filter_type-1].apply(self.gray_img)
-        elif self.filter_type <=len(self.filters):
-            proc_img=self.filters[self.filter_type-1].apply(self.gray_img_float)
+        elif self.filter_type =='DoG' or \
+                        self.filter_type == 'gauss' or \
+                        self.filter_type == 'bilateral' or \
+                        self.filter_type == 'median' or \
+                        self.filter_type == 'canny':
+             proc_img=self.filters[self.filter_type].apply(self.gray_img)
+        elif self.filter_type in self.filters.keys():
+            proc_img=self.filters[self.filter_type].apply(self.gray_img_float)
         else:
-            print "Invalid filter type"
+            print "Invalid filter type ",self.filter_type
             return None
         return proc_img
 
@@ -346,28 +447,29 @@ class InteractiveTrackingApp:
             cv2.destroyWindow(self.proc_window_name)
             self.window_inited=False
         cv2.namedWindow(self.proc_window_name,flags=cv2.CV_WINDOW_AUTOSIZE)
-        if self.filter_type>0:
-            for i in xrange(len(self.filters[self.filter_type-1].params)):
-                cv2.createTrackbar(self.filters[self.filter_type-1].params[i].name, self.proc_window_name, self.filters[self.filter_type-1].params[i].multiplier,
-                                   self.filters[self.filter_type-1].params[i].limit, self.updateFilterParams)
+        if self.filter_type!='none':
+            for param in self.filters[self.filter_type].sorted_params:
+                cv2.createTrackbar(param.name, self.proc_window_name,
+                                   param.multiplier,
+                                   param.limit, self.updateFilterParams)
         self.window_inited=True
 
     def updateFilterParams(self, val):
-        if self.filters[self.filter_type-1].validated:
+        if self.filters[self.filter_type].validated:
             return
         #print 'starting updateFilterParams'
-        for i in xrange(len(self.filters[self.filter_type-1].params)):
-            new_val=cv2.getTrackbarPos(self.filters[self.filter_type-1].params[i].name, self.proc_window_name)
-            old_val=self.filters[self.filter_type-1].params[i].multiplier
+        for i in xrange(len(self.filters[self.filter_type].params)):
+            new_val=cv2.getTrackbarPos(self.filters[self.filter_type].params[i].name, self.proc_window_name)
+            old_val=self.filters[self.filter_type].params[i].multiplier
             if new_val!=old_val:
-                self.filters[self.filter_type-1].params[i].updateValue(new_val)
-                if not self.filters[self.filter_type-1].validate():
-                    self.filters[self.filter_type-1].params[i].updateValue(old_val)
-                    cv2.setTrackbarPos(self.filters[self.filter_type-1].params[i].name, self.proc_window_name,
-                                       self.filters[self.filter_type-1].params[i].multiplier)
-                    self.filters[self.filter_type-1].validated=False
+                self.filters[self.filter_type].params[i].updateValue(new_val)
+                if not self.filters[self.filter_type].validate():
+                    self.filters[self.filter_type].params[i].updateValue(old_val)
+                    cv2.setTrackbarPos(self.filters[self.filter_type].params[i].name, self.proc_window_name,
+                                       self.filters[self.filter_type].params[i].multiplier)
+                    self.filters[self.filter_type].validated=False
                 break
-        self.filters[self.filter_type-1].kernel = self.filters[self.filter_type-1].update()
+        self.filters[self.filter_type].kernel = self.filters[self.filter_type].update()
         if self.write_res:
             self.write_res=False
             self.writeResults()
@@ -378,58 +480,124 @@ class InteractiveTrackingApp:
         if self.from_cam:
             dataset_params='cam'
         else:
-            for i in xrange(1, len(self.init_params)):
+            start_id=self.labels.index('type')
+            for i in xrange(start_id, len(self.init_params)):
                 dataset_params=dataset_params+'_'+self.init_params[i]
-            dataset_params=dataset_params+'_%d'%self.times
+            dataset_params=dataset_params+'_%d'%(self.times+1)
         filter_id='none'
         filter_params=''
-        if self.filter_type>0:
-            filter_id=self.filters[self.filter_type-1].type
-            for i in xrange(len(self.filters[self.filter_type-1].params)):
-                filter_params=filter_params+'_'+self.filters[self.filter_type-1].params[i].name\
-                              +'_%d'%self.filters[self.filter_type-1].params[i].val
+        if self.filter_type!='none':
+            filter_id=self.filters[self.filter_type].type
+            for key in self.filters[self.filter_type].params.keys():
+                filter_params=filter_params+'_'+self.filters[self.filter_type].params[key].name\
+                              +'_%d'%self.filters[self.filter_type].params[key].val
         tracker_params=''
-        tracker_id=self.trackers[self.tracker_type-1].type
-        for i in xrange(len(self.trackers[self.tracker_type-1].params)):
-            tracker_params=tracker_params+'_'+self.trackers[self.tracker_type-1].params[i].name\
-                          +'_%d'%self.trackers[self.tracker_type-1].params[i].val
+        #tracker_id=self.trackers[self.tracker_type].type
+        #print 'tracker_id=', tracker_id
+        for key in self.trackers[self.tracker_type].params.keys():
+            tracker_params=tracker_params+'_'+self.trackers[self.tracker_type].params[key].name\
+                          +'_'+str(self.trackers[self.tracker_type].params[key].val)
+
         return [dataset_params, filter_id, filter_params, tracker_params]
 
     def writeResults(self):
+        if self.times==0:
+            return
         print('Saving results...')
         [dataset_params, filter_id, filter_params, tracking_params]=self.getParamStrings()
         self.max_fps = max(self.curr_fps_list[1:])
         min_fps=min(self.curr_fps_list[1:])
         self.max_error = max(self.curr_error_list)
 
-        tracking_res_fname='Results/summary.txt'
+
+        if self.batch_mode:
+            tracking_res_dir='Results/batch'
+        else:
+            tracking_res_dir='Results'
+
+        if not os.path.isdir(tracking_res_dir):
+            os.makedirs(tracking_res_dir)
+
+        tracking_res_fname=tracking_res_dir+'/summary.txt'
+
         if not os.path.exists(tracking_res_fname):
             res_file=open(tracking_res_fname, 'a')
-            res_file.write("tracker".ljust(10)+
-            "\tfilter".ljust(10)+
-            "\tavg_error".rjust(10)+
-            "\tmax_error".rjust(10)+
-            "\tavg_fps".rjust(10)+
-            "\tmax_fps".rjust(10)+
-            "\tmin_fps".rjust(10)+
-            "\tdataset".center(50)+
-            "\tfilter params".center(50)+
-            "\ttracking params".center(50)+'\n')
+            res_file.write(
+                "tracker".ljust(10) +
+                "\tcolor_space".ljust(10) +
+                "\tfilter".ljust(10) +
+                "\tmultichannel".ljust(15) +
+                "\tSCV".ljust(10) +
+                "\tavg_error".rjust(14) +
+                "\tmax_error".rjust(14) +
+                "\tsuccess".rjust(14) +
+                "\tdrift".rjust(14) +
+                "\tavg_fps".rjust(14) +
+                "\tmax_fps".rjust(14) +
+                "\tmin_fps".rjust(14) +
+                "\tdataset".center(50) +
+                "\ttracking params".center(100) +
+                "\tfilter params".center(50) + '\n'
+            )
         else:
             res_file=open(tracking_res_fname, 'a')
 
-        res_file.write(self.tracker_name.ljust(10)+
-                       '\t'+filter_id.ljust(10)+
-                       '\t%10.6f'%self.avg_error+
-                       '\t%10.6f'%self.max_error+
-                       '\t%10.6f'%self.average_fps+
-                       '\t%10.6f'%self.max_fps+
-                       '\t%10.6f'%min_fps+
-                       '\t'+dataset_params.center(50)+
-                       '\t'+filter_params.center(50)+
-                       '\t'+tracking_params.center(50)+'\n')
+        success_rate=float(self.success_count)/float(self.times+1)*100
+        if self.success_count>0:
+            drift=sum(self.success_drift)/float(self.success_count)
+        else:
+            drift=-1
+
+        print 'self.tracker.multi_approach=', self.tracker.multi_approach
+        print 'filter_id=', filter_id
+        print 'self.color_space=', self.color_space
+        print 'self.tracker_type=', self.tracker_type
+
+        res_file.write(
+            self.tracker_type.ljust(10) +
+            "\t" + self.color_space.ljust(10) +
+            "\t" + filter_id.ljust(10) +
+            "\t" + self.tracker.multi_approach.ljust(15) +
+            "\t" + str(self.tracker.use_scv).ljust(10) +
+            "\t%13.6f" % self.avg_error +
+            "\t%13.6f" % self.max_error +
+            "\t%13.6f" % success_rate +
+            "\t%13.6f" % drift +
+            "\t%13.6f" % self.average_fps +
+            "\t%13.6f" % self.max_fps +
+            "\t%13.6f" % min_fps +
+            "\t" + dataset_params.center(50) +
+            "\t" + tracking_params.center(100) +
+            "\t" + filter_params.center(50) + "\n"
+        )
         res_file.close()
-        self.savePlots(dataset_params, filter_id, filter_params)
+
+        print 'success rate:', success_rate
+        print 'average fps:', self.average_fps
+        print 'average drift:', drift
+
+        if self.avg_filename is not None and self.agg_filename is not None:
+            print 'writing avg data to ', 'Results/'+self.avg_filename+'.txt'
+            avg_full_name='Results/'+self.avg_filename+'.txt'
+            if not os.path.exists(avg_full_name):
+                avg_file=open(avg_full_name, 'a')
+                avg_file.write(
+                    "parameters".center(len(self.agg_filename)) +
+                    "\tsuccess_rate".center(14) +
+                    "\tavg_fps".center(14) +
+                    "\tavg_drift\n".center(14)
+                )
+            else:
+                avg_file=open(avg_full_name, 'a')
+            avg_file.write(
+                self.agg_filename +
+                "\t%13.6f" % success_rate +
+                "\t%13.6f" % self.average_fps +
+                "\t%13.6f\n" % drift
+            )
+            avg_file.close()
+        self.savePlots(dataset_params, filter_id, filter_params, tracking_params)
+        #webbrowser.open(tracking_res_fname)
 
     def generateCombinedPlots(self):
         combined_fig=plt.figure(1)
@@ -447,21 +615,25 @@ class InteractiveTrackingApp:
                  self.frame_times, self.curr_fps_list, 'g')
         return combined_fig
 
-    def savePlots(self,dataset_params, filter_id, filter_params):
+    def savePlots(self,dataset_params, filter_id, filter_params, tracking_params):
         print('Saving plot data...')
-
-        plot_dir="Results/"+self.tracker_name+'/'+filter_id
+        if self.batch_mode:
+            res_dir='Results/batch/'+self.tracker_type+'/'+filter_id
+        else:
+            res_dir='Results/'+self.tracker_type+'/'+filter_id
+        plot_dir=res_dir+'/plots'
+        res_template=dataset_params+'_'+filter_params+'_'+self.color_space\
+                     +'_'+self.tracker.multi_approach+'_scv_'+str(self.tracker.use_scv)
         if not os.path.isdir(plot_dir):
             os.makedirs(plot_dir)
-        plot_fname=plot_dir+'/'+dataset_params+'_'+filter_params
-
+        plot_fname=plot_dir+'/'+res_template
         combined_fig=self.generateCombinedPlots()
-
         combined_fig.savefig(plot_fname, ext='png', bbox_inches='tight')
         plt.figure(0)
 
-        res_fname=plot_fname+'.txt'
+        res_fname=res_dir+'/'+res_template+'.txt'
         res_file=open(res_fname,'w')
+        res_file.write(tracking_params+'\n')
         res_file.write("curr_fps".rjust(10)+"\t"+"avg_fps".rjust(10)+"\t\t"+
                        "curr_error".rjust(10)+"\t"+"avg_error".rjust(10)+"\n")
         for i in xrange(len(self.avg_fps_list)):
@@ -469,7 +641,13 @@ class InteractiveTrackingApp:
                            "%10.5f\t\t" % self.avg_fps_list[i] +
                            "%10.5f\t" % self.curr_error_list[i] +
                            "%10.5f\n" % self.avg_error_list[i])
-        #print "done"
+        res_file.close()
+        getThresholdVariations(res_dir, res_template, 'error', show_plot=False,
+                           min_thresh=0, diff=1, max_thresh=100, max_rate=100,
+                           agg_filename=self.agg_filename)
+        getThresholdVariations(res_dir, res_template, 'fps', show_plot=False,
+                           min_thresh=0, diff=1, max_thresh=30, max_rate=100,
+                           agg_filename=self.agg_filename)
 
     def cleanup(self):
         self.res_file.close()

@@ -2,17 +2,22 @@ from Homography import *
 from InteractiveTracking import *
 from matplotlib import pyplot as plt
 from matplotlib import animation
-import os.path
+import init
+from FilteringParams import *
+from TrackingParams import *
+import sys
 
 class StandaloneTrackingApp(InteractiveTrackingApp):
     """ A demo program that uses OpenCV to grab frames. """
 
-    def __init__(self, vc, init_frame, root_path,
-                 params, labels, default_id, buffer_size):
+    def __init__(self, init_frame, root_path,
+                 params, tracking_params, filtering_params, labels, default_id,
+                 buffer_size, success_threshold=5, batch_mode=False,
+                 agg_filename=None, avg_filename=None):
         track_window_name = 'Tracked Images'
-        InteractiveTrackingApp.__init__(self, init_frame, root_path, track_window_name,
-                                        params, labels, default_id)
-        self.vc = vc
+        InteractiveTrackingApp.__init__(self, init_frame, root_path, track_window_name, params,
+                                        tracking_params, filtering_params, labels, default_id,
+                                        success_threshold, batch_mode, agg_filename, avg_filename)
         self.buffer_id=0
         self.buffer_end_id=-1
         self.buffer_start_id=0
@@ -28,21 +33,24 @@ class StandaloneTrackingApp(InteractiveTrackingApp):
         self.cam_skip_frames=50
 
     def run(self):
+        if self.batch_mode and self.source=='camera':
+            raise SystemExit('Batch mode cannot be run with camera')
         i = self.init_frame
-        while i < self.no_of_frames:
-            img_path = self.img_path + '/img%d.jpg' % (i + 1)
-            img = cv2.imread(img_path)
-            if img == None:
-                print("error loading image %s" % img_path)
-                break
-            if not self.on_frame(img, i):
-                break
+        while True:
+            #if not self.keyboardHandler():
+            #    self.writeResults()
+            #    sys.exit()
+            if not self.updateTracker(i):
+                self.writeResults()
+                sys.exit()
+            #if self.img is not None:
+            #    self.display()
             i += 1
-        self.cleanup()
 
-    def updateTracker(self,i):
+    def updateTracker(self, i):
         if self.reset:
             self.reset=False
+            self.inited=False
             self.initPlotParams()
         if self.exit_event or i==self.no_of_frames-1:
             return False
@@ -74,6 +82,7 @@ class StandaloneTrackingApp(InteractiveTrackingApp):
         self.avg_error_list.append(self.avg_error)
         self.curr_fps_list.append(self.current_fps)
         self.avg_fps_list.append(self.average_fps)
+
         return True
 
     def onKeyPress(self, event):
@@ -106,6 +115,8 @@ class StandaloneTrackingApp(InteractiveTrackingApp):
                 print "Writing results enabled"
             else:
                 print "Writing results disabled"
+        elif key==ord('t') or key==ord('T'):
+            self.tracker_pause=not self.tracker_pause
         elif key==ord('r') or key==ord('R'):
             if self.from_frame_buffer:
                 self.rewind=not self.rewind
@@ -130,7 +141,7 @@ class StandaloneTrackingApp(InteractiveTrackingApp):
             ax.set_xlim(0, frame_count)
         if self.switch_plot:
             self.switch_plot=False
-            print "here we are"
+            #print "here we are"
             if self.plot_fps:
                 fig.canvas.set_window_title('FPS')
                 plt.ylabel('FPS')
@@ -213,11 +224,9 @@ class StandaloneTrackingApp(InteractiveTrackingApp):
                 self.buffer_end_id=self.buffer_start_id
                 self.buffer_start_id=(self.buffer_start_id+1) % self.buffer_size
 
-        if self.img != None:
+        if self.img is not None:
             self.display()
-
         self.updatePlots(i)
-
         return line1, line2
 
 def simData():
@@ -232,42 +241,113 @@ def simData():
             i=0
         yield i
 
+def processArguments(args):
+    no_of_args=len(args)
+    if no_of_args%2!=0:
+        print 'args=\n', args
+        raise SystemExit('Error in processArguments: '
+                         'Optional arguments need to be specified in pairs')
+    agg_filename=None
+    avg_filename=None
+    for i in xrange(no_of_args/2):
+        arg_label=sys.argv[i*2+1]
+        arg_val=sys.argv[i*2+2]
+        #print 'arg_label=', arg_label
+        #print 'arg_val=', arg_val
+        if arg_label in labels:
+            arg_index=labels.index(arg_label)
+            #print 'arg_index=', arg_index
+            if arg_label=='task':
+                task_types=params[labels.index('type')]
+                simple_tasks=params[labels.index('task')][task_types.index('simple')]
+                complex_tasks=params[labels.index('task')][task_types.index('complex')]
+                if arg_val in simple_tasks:
+                    task_id=0
+                elif arg_val in complex_tasks:
+                    task_id=1
+                else:
+                    raise SystemExit('Invalid task provided')
+                default_id[labels.index('type')]=task_id
+                default_id[arg_index]=params[arg_index][task_id].index(arg_val)
+            else:
+                default_id[arg_index]=params[arg_index].index(arg_val)
+        else:
+            tracker_index=labels.index('tracker')
+            current_tracker=params[tracker_index][default_id[tracker_index]]
+            filter_index=labels.index('filter')
+            current_filter=params[filter_index][default_id[filter_index]]
+            curr_tracking_params=tracking_params[current_tracker]
+            if current_filter=='none':
+                curr_filtering_params={}
+            else:
+                curr_filtering_params=filtering_params[current_filter]
+            if arg_label in curr_tracking_params.keys():
+                param_type=curr_tracking_params[arg_label]['type']
+                if param_type=='int':
+                    arg_val=int(arg_val)
+                elif param_type=='float':
+                    arg_val=float(arg_val)
+                elif param_type=='boolean':
+                    if arg_val.lower()=='true':
+                        arg_val=True
+                    elif arg_val.lower()=='false':
+                        arg_val=False
+                    else:
+                        msg='Invalid value ',arg_val, ' specified for parameter ',arg_label
+                        raise SystemExit(msg)
+                curr_tracking_params[arg_label]['default']=arg_val
+            elif arg_label in curr_filtering_params.keys():
+                #param_type=curr_filtering_params[arg_label]['type']
+                #if param_type=='int':
+                #    arg_val=int(arg_val)
+                #elif param_type=='float':
+                #    arg_val=float(arg_val)
+                arg_val=int(arg_val)
+                #param_base=current_filter[arg_label]['default']['base']
+                #param_add=current_filter[arg_label]['type']['add']
+                param_limit=curr_filtering_params[arg_label]['default']['limit']
+                #mult=(arg_val-param_add)/param_base
+                mult=arg_val
+                if mult>param_limit:
+                    msg='Specified value ', arg_val, 'for parameter ', arg_label,\
+                        'exceeds the maximum allowed value.'
+                    raise SystemExit(msg)
+                curr_filtering_params[arg_label]['default']['mult']=mult
+            elif arg_label=='aggregate':
+                agg_filename=arg_val
+            elif arg_label=='average':
+                avg_filename=arg_val
+            else:
+                raise SystemExit('Error in processArguments:'
+                                 'Invalid argument '+arg_label+' provided')
+    return agg_filename, avg_filename
+
 if __name__ == '__main__':
 
     init_frame = 0
+    success_threshold=5
     frame_buffer_size=1000
     root_path = 'G:/UofA/Thesis/#Code/Datasets'
 
-    sources=['file', 'camera']
-    tracker_ids=['nn', 'esm', 'ict', 'l1']
-    filter_ids=['none', 'gabor', 'laplacian', 'sobel', 'scharr', 'canny',
-                'gauss', 'median', 'bilateral',
-                'LoG', 'DoG']
-    task_type=['simple', 'complex']
-    actors=['Human', 'Robot']
-    light_conditions=['nl', 'dl']
-    speeds=['s1', 's2', 's3', 's4', 's5', 'si']
-    complex_tasks=['bus', 'highlighting', 'letter', 'newspaper']
-    simple_tasks=['bookI', 'bookII', 'bookIII', 'cereal', 'juice', 'mugI', 'mugII', 'mugIII']
-    tasks=[simple_tasks, complex_tasks]
-    params=[sources, filter_ids, tracker_ids, task_type, actors, light_conditions, speeds, tasks]
-    labels=['source', 'filter', 'tracker', 'type', 'actor', 'light', 'speed', 'task']
-    default_id=[0, 0, 3, 0, 0, 0, 2, 2]
+    [params, labels, default_id]=init.getBasicParams()
+    tracking_params=init.getTrackingParams()
+    filtering_params=init.getFilteringParams()
 
-    #nn_tracker = NNTracker(600, 2, res=(40, 40), use_scv=False)
-    #esm_tracker = ESMTracker(5, res=(40, 40), use_scv=False)
-    #ict_tracker=BakerMatthewsICTracker(10)
-    #cascade_tracker = CascadeTracker([nn_tracker, esm_tracker])
-    #
-    #trackers=[nn_tracker, esm_tracker, ict_tracker, cascade_tracker]
+    agg_filename=None
+    avg_filename=None
+    batch_mode=False
+    if len(sys.argv)>2:
+        agg_filename, avg_filename=processArguments(sys.argv[1:])
+        print 'avg_filename=', avg_filename
+        batch_mode=True
 
-    app = StandaloneTrackingApp(None, init_frame,root_path,
-                                params, labels, default_id, frame_buffer_size)
-
-    run_type=1
-    if run_type==0:
+    app = StandaloneTrackingApp(init_frame,root_path, params, tracking_params,
+                                filtering_params, labels, default_id, frame_buffer_size,
+                                success_threshold,batch_mode=batch_mode,
+                                agg_filename=agg_filename, avg_filename=avg_filename)
+    if batch_mode:
         app.run()
-    elif run_type==1:
+    else:
         fig = plt.figure(0)
         fig.canvas.set_window_title('Tracking Error')
         cid = fig.canvas.mpl_connect('key_press_event', app.onKeyPress)

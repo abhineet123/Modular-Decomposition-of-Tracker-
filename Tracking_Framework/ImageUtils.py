@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from scipy import weave
 from scipy.weave import converters
-
+from SL3HomParam import make_hom_sl3
 from Homography import *
 
 def draw_region(img, corners, color, thickness=1, draw_x=False):
@@ -65,6 +65,8 @@ def to_grayscale(img):
     """
     for (int i = 0; i < height; i++) {
       for (int j = 0; j < width; j++) {
+      for (int j = 0; j < width; j++) {
+
         double mean = 0;
         for (int k = 0; k < depth; k++) mean += img(i,j,k);
         grayscale(i,j) = mean / depth;
@@ -76,31 +78,31 @@ def to_grayscale(img):
                  compiler='gcc')
     return grayscale
 
-def sample_region(img, pts, warp=np.eye(3), result=None):
+def sample_region(img, pts, warp=np.eye(3), result=None, flatten=False):
     """ Samples the image intenisty at a collection of points.
 
-    Notes: 
+    Notes:
     ------
-      - Only works with grayscale images. 
+      - Only works with grayscale images.
       - All points outside the bounds of the image have intensity 128.
 
     Parameters:
     -----------
     img : (n,m) numpy array
       The image to be sampled from.
-     
+
     pts : (2,k) numpy array
       The points to be sampled out of the image. These may be sub-pixel
       coordinates, in which case bilinear interpolation is used.
 
     result : (k) numpy array (optional)
-      Optionally you can pass in a results vector which will store the 
+      Optionally you can pass in a results vector which will store the
       sampled vector. If you do not supply one, this function will allocate
       one and return a reference.
-    
+
     Returns:
     --------
-    Returns a (k) numpy array containing the intensities of the given 
+    Returns a (k) numpy array containing the intensities of the given
     sub-pixel coordinates in the provided image.
     """
     #np.savetxt("image.txt",img,fmt='%6.2f', delimiter='\t')
@@ -146,6 +148,133 @@ def sample_region(img, pts, warp=np.eye(3), result=None):
                  compiler='gcc')
     return result
 
+def sample_region_vec(img, pts, warp=np.eye(3), result=None, flatten=False):
+    #np.savetxt("image.txt",img,fmt='%6.2f', delimiter='\t')
+    #exit()
+    if len(img.shape)<2:
+        raise SystemExit('Error in sample_region_vec:'
+                         'Image is not multichannel')
+    num_pts = pts.shape[1]
+    (height, width, dim) = img.shape
+    w = np.asarray(warp)
+    ##import pdb;pdb.set_trace()
+    #if result == None:
+    #    result = np.empty((num_pts,dim))
+    support_code = \
+    """
+    double bilinear_interp(blitz::Array<double,3> img, int width, int height, double x, double y, int dim) {
+        using std::floor;
+        using std::ceil;
+        const int lx = floor(x);
+        const int ux = ceil(x);
+        const int ly = floor(y);
+        const int uy = ceil(y);
+        if (lx < 0 || ux >= width || ly < 0 || uy >= height)
+            return 128;
+        const double ulv = img(ly,lx,dim);
+        const double urv = img(ly,ux,dim);
+        const double lrv = img(uy,ux,dim);
+        const double llv = img(uy,lx,dim);
+        const double dx = x - lx;
+        const double dy = y - ly;
+        return ulv*(1-dx)*(1-dy) + urv*dx*(1-dy) + llv*(1-dx)*dy + lrv*dx*dy;
+    }
+    """
+    #if False:
+    #    result = np.empty(num_pts*dim)
+    #    code = \
+    #    """
+    #    for (int i = 0; i < num_pts; i++) {
+    #        for (int j = 0; j < dim; j++) {
+    #            double d = w(2,0)*pts(0,i) + w(2,1)*pts(1,i) + w(2,2);
+    #            double x = (w(0,0)*pts(0,i) + w(0,1)*pts(1,i) + w(0,2)) / d;
+    #            double y = (w(1,0)*pts(0,i) + w(1,1)*pts(1,i) + w(1,2)) / d;
+    #            result(i*dim+j) = bilinear_interp(img, width, height, x, y, j);
+    #        }
+    #    }
+    #    """
+    #else:
+    result = np.zeros((num_pts,dim))
+    code = \
+    """
+    for (int i = 0; i < num_pts; i++) {
+        for (int j = 0; j < dim; j++) {
+            double d = w(2,0)*pts(0,i) + w(2,1)*pts(1,i) + w(2,2);
+            double x = (w(0,0)*pts(0,i) + w(0,1)*pts(1,i) + w(0,2)) / d;
+            double y = (w(1,0)*pts(0,i) + w(1,1)*pts(1,i) + w(1,2)) / d;
+            result(i, j) = bilinear_interp(img, width, height, x, y, j);
+        }
+    }
+    """
+    weave.inline(code, ["img", "result", "w", "pts", "num_pts", "width", "height", "dim"],
+                 support_code=support_code, headers=["<cmath>"],
+                 type_converters=converters.blitz,
+                 compiler='gcc')
+
+    if flatten:
+        result=flattenArray(result)
+        #np.savetxt('result.txt', result, fmt='%12.6f')
+        #if use_hoc:
+        #    result_int=result.astype(np.uint16)
+        #    #np.savetxt('result_int.txt', result_int, fmt='%d')
+        #    hist, edges=np.histogram(result_int,bins=256, range=(0, 255))
+        #    #hist=np.asarray(hist)
+        #    #print 'hist.ndim=', hist.ndim
+        #    #np.savetxt('hist.txt',hist, fmt='%d')
+        #    #print 'hist=\n', hist
+        #    result=np.asarray(hist).T
+        #result=result.reshape((-1, 1))
+        #np.savetxt('result.txt', result, fmt='%12.6f')
+        #np.savetxt('result1.txt', result1, fmt='%12.6f')
+        #np.savetxt('result2.txt', result2, fmt='%12.6f')
+    #else:
+    #    if use_hoc:
+    #        hist=np.empty((dim, 256))
+    #        for i in xrange(dim):
+    #            channel=result[i, :]
+    #            np.savetxt('channel.txt', channel, fmt='%12.6f')
+    #            ch_hist, edges=np.histogram(channel,bins=256, range=(0, 255))
+    #            hist[i,:]=ch_hist
+    #        result=np.asarray(hist).astype(np.int32).T
+
+    #np.savetxt('result.txt', result, fmt='%12.6f')
+    #print "img shape=", img.shape
+    #print "result shape=", result.shape
+
+    return result.T
+
+def flattenArray(in_array):
+    if len(in_array.shape)!=2:
+        raise SyntaxError('Array is not 2D')
+    [npts, dim]=in_array.shape
+
+    in_array=np.asarray(in_array, dtype=np.float64)
+    out_vector=np.zeros(npts*dim, dtype=np.float64)
+    code = \
+    """
+    for (int i = 0; i < npts; i++) {
+        for (int j = 0; j < dim; j++) {
+            out_vector(i*dim+j)=in_array(i, j);
+        }
+    }
+    """
+    #print 'running weave'
+    weave.inline(code, ["in_array", "out_vector", "npts", "dim"],
+                 type_converters=converters.blitz,
+                 compiler='gcc')
+    #print 'done'
+    return out_vector
+
+def flattenArrayPython(in_array):
+    if len(in_array.shape)!=2:
+        raise SyntaxError('Array is not 2D')
+    [npts, dim]=in_array.shape
+    out_vector=np.empty(npts*dim)
+    for i in xrange(npts):
+        for j in xrange(dim):
+            out_vector[i*dim+j]=in_array[i, j]
+    return out_vector
+
 def sample_and_normalize(img, pts, warp=np.eye(3)):
     """ Samples the image intensity at a collection of points 
     and normalizes the result.
@@ -157,9 +286,50 @@ def sample_and_normalize(img, pts, warp=np.eye(3)):
     ---------
     sample_region
     """
-    result = sample_region(img, pts, warp);
+    result = sample_region(img, pts, warp)
     #result -= result.mean()
     return result
+
+def sample_and_normalize_vec(img, pts, warp=np.eye(3), flatten=False):
+    """ Samples the image intensity at a collection of points
+    and normalizes the result.
+
+    Identical to sample_region, except the result is shifted
+    so that it's components have mean 0.
+
+    See Also:
+    ---------
+    sample_region
+    """
+    result = sample_region_vec(img, pts, warp, flatten=flatten)
+    #result -= result.mean()
+    return result
+
+def estimate_jacobian(img, pts, initial_warp, eps=1e-10):
+    n_pts = pts.shape[1]
+    def f(p):
+        W = initial_warp * make_hom_sl3(p)
+        return sample_region(img, pts, W)
+    jacobian = np.empty((n_pts, 8))
+    for i in xrange(0, 8):
+        o = np.zeros(8)
+        o[i] = eps
+        jacobian[:, i] = (f(o) - f(-o)) / (2 * eps)
+    return np.asmatrix(jacobian)
+
+def estimate_jacobian_vec(img, pts, initial_warp, eps=1e-10):
+    n_pts = pts.shape[1]*img.shape[2]
+
+    def f(p):
+        W = initial_warp * make_hom_sl3(p)
+        return sample_region_vec(img, pts, W, flatten=True)
+
+    jacobian = np.empty((n_pts, 8))
+    for i in xrange(0, 8):
+        o = np.zeros(8)
+        o[i] = eps
+        jacobian[:, i] = (f(o) - f(-o)) / (2 * eps)
+    return np.asmatrix(jacobian)
 
 def image_gradient(img, pts, warp=None):
     """ Computes the spatial image gradient at a collection of points.
@@ -216,20 +386,63 @@ def res_to_pts(res, ul=(-.5,-.5), lr=(.5,.5)):
                              itertools.product(np.linspace(ul[0], lr[0], res[0]), 
                                                np.linspace(ul[1], lr[1], res[1]))))).T
 
-def applyGaborFilter(src_img, gabor_params=None):
-    if gabor_params!=None:
-        ksize=gabor_params.ksize
-        sigma=gabor_params.sigma
-        theta=gabor_params.theta
-        lambd=gabor_params.lambd
-        gamma=gabor_params.gamma
-    else:
-        ksize=3
-        sigma=1
-        theta=0
-        lambd=10
-        gamma=0.5
-    gabor_kernel=cv2.getGaborKernel((ksize, ksize), sigma, theta, lambd, gamma)
-    #print gabor_kernel
-    proc_img=cv2.filter2D(src_img, -1, gabor_kernel)
-    return proc_img
+def convertTo3D(img):
+    pass
+
+def getMean(obj_list):
+    no_of_objs=len(obj_list)
+    if no_of_objs<1:
+        raise SyntaxError('no objects in the list')
+    obj=obj_list[0]
+    obj_shape=obj.shape
+    obj_dim=len(obj_shape)
+    obj_sum=np.zeros(obj_shape)
+    for i in xrange(no_of_objs):
+        current_obj=obj_list[i]
+        if len(current_obj.shape)!=obj_dim:
+            raise SyntaxError('objects have inconsistent dimensions')
+        #print "obj ", i, ":\n", current_obj
+        obj_sum=np.add(obj_sum, current_obj)
+        #print "obj_sum:\n", obj_sum
+    obj_mean=obj_sum/no_of_objs
+    #print "obj_mean:\n", obj_mean
+    return obj_mean
+
+def getHistogram(img):
+    hist=np.zeros(256, dtype=np.float64)
+    npts=img.shape[0]
+    #print 'npts=', npts
+    code = \
+    """
+    for (int i = 0; i < npts; i++) {
+        int intensity=img(i);
+        hist(intensity)++;
+    }
+    """
+    #print 'running weave'
+    weave.inline(code, ["img", "hist", "npts"],
+                 type_converters=converters.blitz,
+                 compiler='gcc')
+    #np.savetxt('img.txt', img.T, fmt='%f')
+    #np.savetxt('hist.txt', hist.T, fmt='%f')
+    return hist
+
+def getHistogramVec(img):
+    n_dim, n_pts=img.shape
+    hist=np.zeros((n_dim,256), dtype=np.float64)
+    code = \
+    """
+    for (int i = 0; i < n_dim; i++) {
+        for (int j = 0; j < n_pts; j++) {
+            int intensity=img(i, j);
+            hist(i, intensity)++;
+        }
+    }
+    """
+    #print 'running weave'
+    weave.inline(code, ["img", "hist", "n_pts", "n_dim"],
+                 type_converters=converters.blitz,
+                 compiler='gcc')
+    #np.savetxt('img_mean.txt', img.T, fmt='%f')
+    #np.savetxt('hist_mean.txt', hist.T, fmt='%f')
+    return hist
